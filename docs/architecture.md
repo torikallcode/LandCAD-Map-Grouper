@@ -569,13 +569,41 @@ tetap mendapat skor 91.4, jadi perbandingan yang adil tidak dirugikan.
 
 ## Clustering
 
-- **Graph-based / connected components** di atas ambang taut.
-- Transitif: kalau A~B dan B~C, ketiganya satu kelompok.
+- **Average linkage (UPGMA)** di atas ambang taut — bukan single linkage.
 - Skor minimum kelompok **hanya dihitung dari pasangan yang benar-benar bertaut**.
-  Pasangan lemah di dalam kelompok transitif (A~C = 40) adalah artefak transitivitas,
-  bukan bukti kelompok lemah. Tanpa aturan ini kelompok sehat bisa salah dilabeli
-  "Rendah" (bug ditemukan lewat test).
 - Singleton tidak dipaksa berkelompok; masuk `ungrouped`.
+
+### Perbaikan penting: chaining pada batch besar
+
+Laporan pengguna: **118 PDF dengan peta berbeda semuanya masuk satu kelompok.**
+
+Penyebabnya *single linkage* (connected components). Single linkage hanya butuh
+**satu** pasangan perbatasan untuk menyatukan dua kelompok, sehingga rantai
+antarpeta bertetangga menyeret seluruh batch menjadi satu KELOMPOK.
+
+Direproduksi: 118 dokumen, 3 lokasi (40/40/38), pasangan asli 68–96, pasangan
+tetangga 62–72 dengan peluang 10%.
+
+| Strategi | Hasil |
+| --- | --- |
+| single linkage @65 (sebelumnya) | **1 kelompok berisi 118 dokumen** |
+| complete linkage @65–78 | over-fragmentasi (30+ kelompok kecil) |
+| **average linkage @65** | **3 kelompok: 40 / 40 / 38** |
+
+Complete linkage ditolak karena memecah kelompok sah menjadi potongan kecil;
+average linkage hanya butuh kesamaan **rata-rata** antar anggota, sehingga satu
+jembatan tidak cukup untuk menggabungkan dua kelompok, tetapi kelompok asli yang
+skornya tidak merata tetap utuh.
+
+Diuji pada lima skenario (tetangga 60–74, pasangan asli 66–96, 3–6 lokasi, grup
+kecil 2 dokumen berskor 77,2): average linkage @65 benar di semuanya, termasuk
+mempertahankan grup kecil yang hanya berskor 77,2 — sementara menaikkan ambang ke
+85 akan merusaknya.
+
+Biaya: O(n³) dengan update Lance-Williams, terukur 3 ms untuk 118 dokumen,
+31 ms untuk 300, dan 3,2 s untuk 999.
+
+`ClusterConfig(linkage="single")` tetap tersedia untuk diagnosis/perbandingan.
 
 ## Prefilter: keterbatasan yang terdokumentasi
 
@@ -622,3 +650,403 @@ Pasangan asli: 68.4–96.3   Pasangan asing: 0.0
 | `tests/test_clustering.py` | Ambang, transitivitas, kelompok terpisah, ungrouped, matriks, cancel |
 | `tests/test_grouping_service.py` | Persiapan parcel-free, progres, kegagalan, grouping SU_057/SU_058 |
 | `tests/test_group_results_view.py` | Pohon kelompok, ungrouped, rincian, sinyal, error |
+
+---
+
+# Phase 6 — Group Review & Export
+
+## Tujuan fase
+
+Memungkinkan pengguna mengoreksi hasil pengelompokan secara manual, lalu mengekspor
+laporan dan menyalin dokumen ke folder kelompok — tanpa pernah menyentuh file asli.
+
+## Modul baru
+
+| File | Tanggung jawab |
+| --- | --- |
+| `core/review_model.py` | `ReviewState` immutable: move, merge, split, create, verify |
+| `services/export_service.py` | Laporan CSV/XLSX, penyalinan file ke folder kelompok |
+
+Perubahan: `app/group_results_view.py` (bar koreksi + tombol ekspor/salin),
+`core/clustering_engine.py` (`SimilarityEdge.match_count` untuk kolom laporan).
+
+## Model review
+
+Semua operasi mengembalikan **state baru** (frozen dataclass), sehingga:
+
+- Dokumen tidak pernah hilang atau terduplikasi.
+- Perubahan bisa di-reset ke hasil otomatis kapan saja.
+- Tidak ada state parsial bila sebuah operasi gagal.
+
+| Operasi | Perilaku |
+| --- | --- |
+| `move_document(key, target)` | Pindah ke kelompok lain, atau ke ungrouped bila `None` |
+| `merge_groups(ids, target)` | Gabung beberapa kelompok; id target dipertahankan |
+| `split_document(key)` | Keluarkan dari kelompok (masuk ungrouped) |
+| `create_group(keys)` | Bentuk kelompok baru; id = maksimum + 1 |
+| `set_verified(id, bool)` | Tandai / batalkan verifikasi |
+| `verify_all()` | Tandai semua terverifikasi |
+| `reset(clustering)` | Kembali ke hasil otomatis |
+
+### Aturan konsistensi
+
+1. Kelompok yang kehilangan semua anggota **dihapus**.
+2. Setiap perubahan anggota **membatalkan verifikasi** kelompok itu — hasil yang
+   berubah tidak boleh tampak sudah diverifikasi.
+3. `min_pair_score` dan `confidence` **dihitung ulang** dari skor pasangan yang
+   benar-benar bertaut (≥ 65), bukan dari semua pasangan.
+
+## Laporan (PRD 10A)
+
+Kolom persis sesuai PRD, dalam urutan yang sama:
+
+| Kolom | Sumber |
+| --- | --- |
+| Nama file | `PdfInfo.filename` |
+| Nomor SU | Pola `SU_<angka>` pada nama file; kosong bila tidak cocok |
+| Halaman peta | Jumlah halaman dokumen |
+| ID kelompok | `KELOMPOK_xxx` atau `BELUM_TERKELOMPOK` |
+| Jumlah pasangan cocok | `SimilarityEdge.match_count` pasangan terbaik |
+| Skor kemiripan | Skor terbaik anggota di dalam kelompoknya |
+| Confidence | Keyakinan kelompok |
+| Status | `Terverifikasi` / `Perlu verifikasi` |
+
+Nomor SU **tidak dikarang**: bila nama file tidak mengikuti pola `SU_057`,
+kolomnya dikosongkan.
+
+Format: XLSX (default, header tebal, lebar kolom diatur) atau CSV (delimiter `;`,
+UTF-8 BOM agar Excel membaca karakter Indonesia dengan benar).
+
+## Penyalinan file (PRD 10B)
+
+- Operasi **COPY** (`shutil.copy2`), tidak pernah move/delete.
+- Struktur: `KELOMPOK_001/`, `KELOMPOK_002/`, `BELUM_TERKELOMPOK/`.
+- Nama folder disanitasi (`safe_folder_name`).
+- Tanpa `overwrite`, file yang sudah ada **dilewati** dan dilaporkan, sehingga
+  penyalinan berulang aman.
+- Diuji: setelah penyalinan, isi file asli byte-identik
+  (`test_copy_never_moves_originals`).
+
+## Batasan Phase 6
+
+- Belum ada penyimpanan ke SQLite: review hilang saat aplikasi ditutup (Phase 7).
+- Belum ada ekspor PDF laporan (opsional pada PRD).
+- Belum ada drag-and-drop untuk memindahkan dokumen antar kelompok; koreksi lewat
+  tombol dan dropdown.
+- Belum ada pengaturan threshold di UI (masih konstan di `config`/`ClusterConfig`).
+- Penyalinan berjalan di thread UI; untuk ratusan file ini akan terasa lambat
+  (Phase 7).
+
+## Pengujian Phase 6
+
+| Berkas | Cakupan |
+| --- | --- |
+| `tests/test_review_model.py` | Semua operasi review, integritas dokumen, imutabilitas, reset |
+| `tests/test_export_service.py` | Kolom PRD, CSV/XLSX, nomor SU, penyalinan, file asli utuh |
+| `tests/test_group_results_view.py` | Verifikasi, merge, split, reset, detail, regression seleksi |
+
+---
+
+# Phase 7 — Optimization
+
+## Tujuan fase
+
+Menjadikan aplikasi layak untuk batch 100–999 PDF: cache, background processing,
+recovery, dan paket distribusi — tanpa mengubah hasil perhitungan.
+
+## Profil sebelum optimasi (diukur, bukan diasumsikan)
+
+| Tahap | Waktu |
+| --- | --- |
+| render 2 halaman (120 dpi) | 761 ms |
+| deteksi halaman peta | 155 ms |
+| normalisasi | 105 ms |
+| deteksi bidang | 32 ms |
+| **ORB (fitur)** | **27–31 ms** |
+| `prepare_comparable` total | ~1.070 ms |
+
+Kesimpulan penting: ORB bukan bottleneck. Render + deteksi + normalisasi mendominasi,
+padahal hasilnya identik setiap kali untuk file yang sama.
+
+## Cache analisis
+
+`services/cache_service.py` menyimpan per dokumen:
+
+- `meta.json` — skor deteksi per halaman, halaman peta, poligon bidang + keyakinan,
+  versi skema, waktu dibuat.
+- `normalized.png`, `masked.png` — gambar hasil normalisasi dan bebas bidang.
+
+Kunci: `sha1(skema | sha256(file) | dpi | versi detektor | versi normalisasi | versi bidang)`.
+
+Konsekuensi desain:
+
+- Mengubah algoritma **apa pun** otomatis menggugurkan cache — tidak mungkin
+  membandingkan peta hasil pipeline lama dengan pipeline baru secara diam-diam.
+- Cache rusak (JSON/PNG tidak valid, skema berbeda) **dihapus lalu dihitung ulang**,
+  bukan membuat aplikasi gagal.
+
+### Hasil terukur
+
+| Skenario | Sebelum | Sesudah |
+| --- | --- | --- |
+| 2 dokumen, run ulang | 2.573 ms | **170 ms** (15,2×) |
+| per dokumen | ~1.270 ms | **85 ms** |
+| grouping 2 dokumen (hangat) | 2,51 s | **0,35 s** (7,3×) |
+
+Hasil identik diverifikasi: `coverage 0.720700` sama persis dengan/tanpa cache,
+jumlah fitur dan label bidang sama.
+
+Biaya penyimpanan: **166 KB/dokumen** → ~160 MB untuk 999 dokumen.
+
+## Database
+
+Skema sesuai PRD 11, di `database/db.py`:
+
+- `documents`, `features`, `similarity`, `groups`, `group_members`.
+- `PRAGMA foreign_keys = ON`, `journal_mode = WAL`.
+- `original_path` UNIQUE → `upsert_document` memperbarui, bukan menduplikasi.
+- Pasangan similarity selalu disimpan terurut (`document_a < document_b`) agar
+  `UNIQUE (document_a, document_b)` efektif.
+- `connect()` adalah context manager yang **rollback** saat ada error.
+
+Deskriptor fitur tetap berupa file `.npz` (PRD mengizinkan bila lebih efisien).
+
+## Background processing
+
+`app/export_worker.py` menjalankan penulisan laporan dan penyalinan file di QThread
+dengan sinyal progress per file. Sebelumnya penyalinan berjalan di UI thread dan
+membekukan jendela untuk ratusan dokumen.
+
+## Pemulihan kesalahan
+
+| Skenario | Perilaku |
+| --- | --- |
+| PDF rusak | Dicatat per file, batch lanjut |
+| Cache korup | Dihapus, dihitung ulang |
+| Tulis database gagal | Dicatat sebagai warning, UI tetap jalan |
+| Ekspor gagal | Pesan error, tidak ada file parsial |
+| Worker dibatalkan | Pemeriksaan `isInterruptionRequested()` tiap item |
+
+## Packaging
+
+- `LandCADMapGrouper.spec` + `build_exe.bat`.
+- **Bug ditemukan & diperbaiki:** build pertama menulis `data/` ke `_internal`,
+  yang read-only saat terinstal. `config.py` sekarang memakai
+  `sys.executable`'s parent saat `sys.frozen`.
+- Bundle 363 MB → **314 MB** dengan membuang model ONNX `pymupdf-layout`
+  (19 file, ~49 MB) yang tidak pernah dipakai lewat filter `a.datas`.
+- Sisa ukuran didominasi `cv2.pyd` (86 MB) dan `_mupdf.pyd` (12 MB) — keduanya
+  dipakai dan tidak bisa dibuang tanpa mengganti library.
+- Exe diverifikasi **benar-benar dijalankan** (12 detik tanpa crash) dan membuat
+  `data/{cache,logs,output}` + `landcad.db` di sebelah executable.
+
+## Batasan Phase 7
+
+- Cache belum punya batas ukuran/LRU; 999 dokumen ≈ 160 MB dan terus bertambah.
+- Belum ada UI untuk membersihkan cache atau melihat statistiknya.
+- Grouping masih O(n²) pasangan; cache mempercepat, tidak mengurangi jumlahnya.
+- Database menyimpan metadata saja; riwayat sesi (review manual) belum dipulihkan
+  saat aplikasi dibuka kembali.
+- Bundle belum ditandatangani (code signing) dan belum ada installer.
+
+## Pengujian Phase 7
+
+| Berkas | Cakupan |
+| --- | --- |
+| `tests/test_cache_service.py` | Kunci, versi pipeline, round-trip, korupsi, clear/stats, speedup |
+| `tests/test_database.py` | Skema, FK, upsert, features, similarity, groups, rollback |
+| `tests/test_packaging.py` | Path frozen/normal, isi spec, build script, larangan jaringan & tulis file asli |
+
+---
+
+# Phase 8 — Penyempurnaan PRD
+
+## Tujuan fase
+
+Menutup tiga celah yang ditemukan saat audit terhadap PRD setelah Phase 7.
+Tidak ada perubahan pada algoritma similarity maupun clustering.
+
+## Celah yang ditutup
+
+| Celah | Bukti sebelum perbaikan |
+| --- | --- |
+| Tabel `similarity`/`groups`/`group_members` tidak pernah diisi | hanya `db.upsert_document` dipanggil |
+| Tidak ada UI ambang (PRD 9) | ambang hanya konstanta modul |
+| Dashboard kurang 2 metrik (PRD 8.1) | tidak ada kartu kelompok & belum berkelompok |
+
+## 1. Persistensi hasil pengelompokan
+
+### Migrasi skema v1 → v2
+
+`SCHEMA_VERSION = 2`. Perubahan: `similarity.match_count` (kolom PRD 10A).
+
+`initialize()` membaca `PRAGMA user_version` lalu memanggil `_migrate()`:
+
+- Kolom hanya ditambahkan bila memang belum ada (`PRAGMA table_info`), sehingga DB
+  baru yang sudah memuat kolom dari `SCHEMA` tidak terkena `ALTER` ganda.
+- Data lama tidak disentuh — hanya `ALTER TABLE ... ADD COLUMN`.
+
+### Semantik penyimpanan
+
+- Dokumen **tanpa** baris di `group_members` = belum terkelompok. Karena itu
+  `ungrouped` tidak butuh tabel sendiri; saat memuat, himpunan itu dihitung ulang.
+- `save_review_state()` menolak bila ada id yang sekaligus berkelompok dan belum
+  terkelompok (`ValueError`) — menjaga integritas.
+- `normalize_path_key()` menyamakan aturan path dengan `PdfInfo.key`
+  (`os.path.normcase(resolve())`) agar hasil tersimpan bisa dipasangkan kembali
+  pada Windows yang case-insensitive.
+
+### Lapisan service
+
+`services/persistence_service.py`:
+
+| Fungsi | Perilaku |
+| --- | --- |
+| `save_review(db, state, documents)` | upsert dokumen → tulis groups/members/similarity. Kegagalan hanya di-log, tidak melempar |
+| `load_review(db, only_within=folder)` | bangun ulang `ReviewState` **tanpa membuka PDF**, lewati path hilang, filter per folder |
+| `clear_review(db)` | hapus groups/members/similarity, dokumen tetap |
+
+Kelompok yang setelah pemuatan tersisa < 2 anggota dianggap tidak valid dan
+dibubarkan menjadi `ungrouped`.
+
+### Alur UI
+
+1. Setiap perubahan review → sinyal `review_changed` → main window menyimpan.
+2. Setelah scan selesai → `_offer_saved_review()` menawarkan pemuatan (dialog).
+3. Tab Hasil Pengelompokan punya tombol **Muat Hasil Tersimpan** yang aktif bila
+   DB memang berisi kelompok untuk folder tersebut.
+
+## 2. Pengaturan ambang
+
+`app/settings_store.py` memakai `QSettings(APP_ORGANIZATION, APP_NAME)` (Qt
+bawaan, tanpa dependency baru). `AppSettings.validated()` menjepit nilai rentang
+dan memaksa `high_confidence_threshold > link_threshold`.
+
+`app/settings_view.py` menyediakan tab **Pengaturan**:
+
+- Ambang taut 40–95, ambang keyakinan tinggi 41–100, ambang halaman peta 0.30–0.80.
+- Prefilter on/off.
+- Simpan / Kembalikan Default / Bersihkan Cache Analisis (dengan konfirmasi).
+- Menolak simpan bila nilai tidak konsisten, dengan pesan.
+
+Penerapan: `main_window` membangun `MapPageDetector(threshold=...)` dan
+`ClusterConfig(...)` dari settings, lalu meneruskannya ke worker. Diuji dengan
+`link_threshold=95`: pengelompokan menghasilkan **0 kelompok** — membuktikan nilai
+benar-benar dipakai, bukan konstanta.
+
+## 3. Dashboard
+
+PRD 8.1: total PDF, berhasil dibaca, gagal dibaca, jumlah kelompok, dokumen belum
+berkelompok, status proses. Dua kartu baru (`groups_card`, `ungrouped_card`)
+diisi dari `group_view.current_review()` dan disegarkan lewat `review_changed`.
+
+## Batasan Phase 8
+
+- Catatan per kelompok (`ReviewedGroup.note`) tidak disimpan: PRD 11 tidak punya
+  kolomnya.
+- Hasil tersimpan bersifat "satu batch terakhir"; tidak ada riwayat beberapa sesi.
+- Ambang belum dikalibrasi pada dataset berlabel (PRD 14) — UI hanya memberi akses
+  untuk bereksperimen.
+
+## Pengujian Phase 8
+
+| Berkas | Cakupan |
+| --- | --- |
+| `tests/test_group_persistence.py` | Migrasi v1→v2 (data utuh), save/load round-trip, filter folder, file hilang, DB rusak |
+| `tests/test_settings.py` | Default, round-trip QSettings, penjepitan, validasi UI, konfirmasi cache |
+| `tests/test_dashboard.py` | Semua metrik PRD 8.1, nilai default, reset |
+
+Total 463 test lolos pada fase ini.
+
+---
+
+# Phase 9 — Perbaikan Akurasi Pengelompokan
+
+## Masalah
+
+Pengguna melaporkan 118 PDF dengan peta berbeda tetap masuk satu kelompok.
+Chaining sudah diperbaiki di Phase 5, jadi penyebabnya ada di **skor**, bukan
+clustering.
+
+## Diagnosis terukur (bukan dugaan)
+
+Ditambahkan `core/diagnose_pair.py` yang memisahkan bukti menjadi **area pinggir**
+(bingkai, panah utara, legenda, teks skala) dan **area isi peta**.
+
+Hasil pada halaman nyata:
+
+| Kasus | overall | **interior** | border | inlier isi | inlier pinggir |
+| --- | --- | --- | --- | --- | --- |
+| Peta **sama** (057 vs 058) | 72.1 | **82.5** | 66.2 | 135 | 206 |
+| Peta **beda**, bingkai sama #1 | 63.5 | **5.8** | 100.0 | **0** | 789 |
+| Peta **beda**, bingkai sama #2 | 65.9 | **1.8** | 100.0 | **0** | 786 |
+| Peta beda tanpa bingkai | 0.0 | 0.0 | 0.0 | 0 | 0 |
+
+Bukti paling jelas: peta berbeda mendapat **border 100.0 dengan 786 inlier di
+pinggir tetapi 0 inlier di area isi**. Bingkai + panah utara + legenda identik di
+semua dokumen, sehingga ORB mencocokkannya di setiap pasangan dan menaikkan skor
+sekitar **+64 poin**.
+
+Temuan kedua: **cakupan seluruh halaman menghukum rotasi**. Rotasi 8° menurunkan
+`ref_cov` ke 0.53 padahal `interior_coverage` tetap 0.82.
+
+## Perbaikan
+
+**1. Bukti wajib dari area isi** (`core/similarity_engine.py`)
+
+- Indikator dominan diganti dari `reference_coverage` → `interior_coverage`
+  (bobot 0.45).
+- Dukungan inlier memakai `interior_inliers`, bukan seluruh inlier.
+- Gate keras baru: `interior_coverage ≥ 0.45` **dan** `interior_inliers ≥ 25`.
+  Alasan blokir menyebut "kecocokan hanya di bingkai/legenda".
+
+**2. Semantik ambang diperbaiki** (`core/clustering_engine.py`)
+
+PRD 9 menyebut 65–84 = *"Perlu pemeriksaan"* — itu **kategori tampilan**, bukan
+syarat gabung. Kode sebelumnya memakai 65 sebagai ambang gabung.
+
+| Skor | Perilaku baru |
+| --- | --- |
+| ≥ 82 (`link_threshold`) | boleh bergabung menjadi kelompok |
+| 65–81 (`candidate_threshold`) | **dilaporkan sebagai kandidat**, tidak digabung |
+| < 65 | tidak berhubungan |
+
+Validator menolak `candidate_threshold >= link_threshold`.
+
+**3. Kandidat ditampilkan di UI**
+
+Tab Hasil Pengelompokan menambah simpul **"Kandidat (perlu pemeriksaan)"** berisi
+pasangan 65–81 — terlihat, dapat diperiksa, tetapi tidak pernah digabung otomatis.
+
+## Hasil sesudah perbaikan
+
+| Kasus | Sebelum | Sesudah |
+| --- | --- | --- |
+| Peta sama (057 vs 058) | 84.4 | **83.0** (tetap bergabung) |
+| Peta sama, rotasi 4° | 78.3 | **82.4** (bergabung) |
+| Peta sama, rotasi 8° | 70.6 | **85.2** (bergabung) |
+| Peta beda, bingkai sama | 63.5–65.9 | **0.0** (ditolak) |
+| Peta beda tanpa bingkai | 0.0 | 0.0 |
+
+Rotasi kini stabil (79.9–85.2) karena tidak lagi dihukum oleh bingkai.
+
+## Batasan Phase 9
+
+- Ambang 82 adalah nilai konservatif dari pengukuran dua dokumen, **bukan hasil
+  kalibrasi** dataset berlabel (PRD 14).
+- Pasangan asli yang lebih lemah dari 82 akan menjadi kandidat, bukan kelompok.
+  Ini disengaja (PRD 21: selalu sediakan pemeriksaan manual).
+- Belum ada masking eksplisit elemen template; perbaikan dilakukan dengan
+  mengabaikan area pinggir saat menilai, bukan menghapusnya dari gambar. Masking
+  penuh tetap opsi bila sampel pengguna menunjukkan sisa gangguan.
+- Grouping tetap O(n²).
+
+## Pengujian Phase 9
+
+| Berkas | Cakupan |
+| --- | --- |
+| `tests/test_region_similarity.py` | Pemisahan region, template isolation, kasus bingkai-sama-peta-beda, ketahanan rotasi |
+| `tests/test_threshold_semantics.py` | 82 gabung, 65–81 kandidat, validasi, skenario 3 lokasi |
+| `tests/test_chaining_regression.py` | Diperbarui ke rentang skor terukur |
+
+Total 487 test lolos pada fase ini.

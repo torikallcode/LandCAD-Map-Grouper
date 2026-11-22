@@ -69,23 +69,49 @@ def test_just_below_threshold_does_not_link():
     assert len(ungrouped) == 2
 
 
-def test_transitive_grouping():
-    """A~B and B~C should place all three together even if A~C is weak."""
+def test_chain_does_not_merge_by_default():
+    """A~B and B~C with a weak A~C must NOT drag all three together.
+
+    This is the fix for the 118-document bug: single linkage would merge all
+    three through B, so a chain of neighbouring maps collapsed an entire batch
+    into one group. Average linkage refuses because the mean of (A~C, B~C) is
+    below the threshold.
+    """
     docs = [_doc("a"), _doc("b"), _doc("c")]
     matrix = _matrix({(0, 1): 90.0, (1, 2): 88.0, (0, 2): 40.0}, 3)
+    groups, ungrouped = build_groups(docs, matrix)
+
+    assert len(groups) == 1
+    assert set(groups[0].member_keys) == {"a", "b"}
+    assert ungrouped == ("c",)
+
+
+def test_chain_merges_when_all_pairs_are_strong():
+    docs = [_doc("a"), _doc("b"), _doc("c")]
+    matrix = _matrix({(0, 1): 90.0, (1, 2): 88.0, (0, 2): 86.0}, 3)
     groups, _ = build_groups(docs, matrix)
 
     assert len(groups) == 1
     assert set(groups[0].member_keys) == {"a", "b", "c"}
-    # The weak a-c pair is a transitive artifact and must not define group strength.
-    assert groups[0].min_pair_score == pytest.approx(88.0, abs=0.1)
     assert groups[0].confidence == "Tinggi"
+
+
+def test_single_linkage_still_chains_when_requested():
+    """The legacy behaviour stays available for comparison/diagnostics."""
+    docs = [_doc("a"), _doc("b"), _doc("c")]
+    matrix = _matrix({(0, 1): 90.0, (1, 2): 88.0, (0, 2): 40.0}, 3)
+    groups, _ = build_groups(docs, matrix, ClusterConfig(linkage="single"))
+
+    assert len(groups) == 1
+    assert set(groups[0].member_keys) == {"a", "b", "c"}
+    # The weak a-c pair must not define the group's reported strength.
+    assert groups[0].min_pair_score == pytest.approx(88.0, abs=0.1)
 
 
 def test_multiple_disjoint_groups():
     docs = [_doc(k) for k in ("a", "b", "c", "d", "e")]
     matrix = _matrix(
-        {(0, 1): 95.0, (2, 3): 80.0, (0, 2): 10.0, (1, 4): 5.0, (3, 4): 12.0}, 5
+        {(0, 1): 95.0, (2, 3): 90.0, (0, 2): 10.0, (1, 4): 5.0, (3, 4): 12.0}, 5
     )
     groups, ungrouped = build_groups(docs, matrix)
 
@@ -96,10 +122,13 @@ def test_multiple_disjoint_groups():
 
 
 def test_group_needing_review_when_min_score_below_high_band():
+    """A group whose weakest linked pair is 82-84 is flagged for review."""
     docs = [_doc("a"), _doc("b"), _doc("c")]
-    matrix = _matrix({(0, 1): 95.0, (1, 2): 70.0}, 3)
+    matrix = _matrix({(0, 1): 95.0, (1, 2): 83.0, (0, 2): 83.0}, 3)
     groups, _ = build_groups(docs, matrix)
 
+    assert len(groups) == 1
+    assert groups[0].min_pair_score == pytest.approx(83.0, abs=0.1)
     assert groups[0].confidence == "Sedang"
     assert groups[0].needs_review
 

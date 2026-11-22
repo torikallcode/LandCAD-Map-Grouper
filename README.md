@@ -3,8 +3,8 @@
 Aplikasi desktop **lokal/offline** untuk mengelompokkan dokumen Surat Ukur (SU) PDF
 berdasarkan kemiripan peta dasar.
 
-> Status: **Phase 5 — Similarity & Clustering** selesai.
-> Review grup manual dan ekspor belum diimplementasikan (Phase 6).
+> Status: **Phase 9 — Perbaikan Akurasi Pengelompokan** selesai.
+> Peta berbeda tidak lagi digabung hanya karena berbagi bingkai halaman.
 
 ## Fitur Phase 1 (PDF Importer & Viewer)
 
@@ -104,7 +104,16 @@ kesepakatan peta dasar.
   kemiripan struktur garis (0.12), sebaran inlier (0.08).
 - **Gerbang keras**: pasangan dengan cakupan acuan < 0.40 atau inlier < 30 ditolak
   (skor 0) walau alignment-nya terlihat bagus.
-- **Graph-based clustering** (connected components) pada pasangan berskor ≥ 65.
+- **Graph-based clustering** pada pasangan berskor ≥ 65.
+
+  > **Perbaikan penting (chaining).** Sebelumnya dipakai *single linkage*: cukup
+  > satu pasangan perbatasan untuk menyatukan dua kelompok. Akibatnya batch 118
+  > PDF dengan peta berbeda semuanya masuk **satu** kelompok. Sekarang dipakai
+  > **average linkage**, yang hanya menyatukan kelompok bila kemiripan
+  > rata-ratanya memenuhi ambang. Diuji: 118 dokumen / 3 lokasi → **3 kelompok
+  > (40/40/38)**, tanpa pencampuran, dan grup kecil 2 dokumen berskor 77,2 tetap
+  > terbentuk.
+
   Dokumen tanpa pasangan **tidak dipaksa** masuk kelompok.
 - **Keyakinan kelompok**: Tinggi (≥85), Sedang (65–84, perlu verifikasi), Rendah.
 - **Tab “Hasil Pengelompokan”**: pohon kelompok + anggota, panel rincian, dan
@@ -151,6 +160,152 @@ dilakukan oleh gerbang cakupan pada tahap skoring.
 
 Review manual dan ekspor laporan **belum** ada di fase ini.
 
+## Fitur Phase 6 (Group Review & Export)
+
+- **Koreksi manual** di tab Hasil Pengelompokan:
+  - Tandai / batalkan **verifikasi** kelompok.
+  - **Gabungkan** kelompok ke kelompok lain.
+  - **Pisahkan** dokumen dari kelompoknya (masuk “Belum Terkelompok”).
+  - **Kembalikan Otomatis** untuk membuang semua koreksi.
+- **Semua koreksi bersifat immutable** — setiap operasi menghasilkan state baru,
+  dokumen tidak pernah hilang atau terduplikasi (`test_every_document_appears_exactly_once`).
+- **Ekspor laporan** CSV atau XLSX dengan 8 kolom sesuai PRD 10A:
+  Nama file, Nomor SU, Halaman peta, ID kelompok, Jumlah pasangan cocok,
+  Skor kemiripan, Confidence, Status.
+- **Salin ke folder** `KELOMPOK_xxx/` dan `BELUM_TERKELOMPOK/` dengan operasi
+  **COPY**, bukan move. File asli tidak pernah diubah atau dihapus.
+- **Konfirmasi sebelum menyalin** bila masih ada kelompok belum terverifikasi.
+
+### Contoh isi laporan
+
+```csv
+Nama file;Nomor SU;Halaman peta;ID kelompok;Jumlah pasangan cocok;Skor kemiripan;Confidence;Status
+SU_057.pdf;057;2;KELOMPOK_001;463;84.4;Sedang;Perlu verifikasi
+SU_058.pdf;058;2;KELOMPOK_001;463;84.4;Sedang;Perlu verifikasi
+```
+
+### Struktur folder hasil
+
+```
+OUTPUT/
+├── KELOMPOK_001/
+│   ├── SU_057.pdf
+│   └── SU_058.pdf
+└── BELUM_TERKELOMPOK/
+```
+
+Menyalin ulang tanpa menimpa melewati file yang sudah ada (`skipped`), sehingga
+aman dijalankan berulang.
+
+## Fitur Phase 7 (Optimization)
+
+- **Cache analisis di disk** (`data/cache/analysis/`): render, deteksi halaman peta,
+  normalisasi, dan mutasi bidang disimpan per dokumen. Kunci cache memakai
+  SHA-256 isi file + versi pipeline (detektor, normalisasi, bidang), jadi
+  perubahan algoritma otomatis menggugurkan cache lama.
+  - Terukur: **1,27 s → 85 ms per dokumen** (15× lebih cepat) dengan hasil identik.
+  - Ukuran ~166 KB per dokumen (160 MB untuk 999 dokumen).
+- **Database SQLite** (`data/landcad.db`) sesuai PRD 11: tabel `documents`,
+  `features`, `similarity`, `groups`, `group_members`. Metadata dokumen dan
+  halaman peta disimpan setelah analisis. Deskriptor fitur tetap di file cache
+  karena PRD mengizinkan file bila lebih efisien.
+- **Ekspor di background thread** — menyalin ratusan PDF tidak lagi membekukan UI,
+  progress ditampilkan per file.
+- **Pemulihan kesalahan**: satu PDF rusak tidak menghentikan batch; cache yang
+  korup dihapus dan dihitung ulang; kegagalan tulis database tidak mematikan UI.
+- **Packaging PyInstaller** (`LandCADMapGrouper.spec` + `build_exe.bat`):
+  `dist/LandCADMapGrouper/LandCADMapGrouper.exe`, bundle ~314 MB.
+  `data/` dibuat di sebelah `.exe`, bukan di `_internal` (yang read-only).
+
+### Angka sebelum/sesudah
+
+| Tahap | Sebelum | Sesudah |
+| --- | --- | --- |
+| Persiapkan 2 dokumen (run ulang) | 2.573 ms | **170 ms** |
+| Grouping 2 dokumen (hangat) | 2,51 s | **0,35 s** |
+| Bundle PyInstaller | 363 MB | 314 MB |
+| Penyalinan 100+ file | membekukan UI | background + progress |
+
+Catatan jujur: pada mesin ini, memperkecil bundle lebih jauh terkendala
+`cv2.pyd` (86 MB) dan `_mupdf.pyd` (12 MB) yang memang dipakai; keduanya tidak
+bisa dibuang tanpa mengganti library.
+
+## Fitur Phase 8 (Penyempurnaan PRD)
+
+Menutup tiga celah yang ditemukan saat audit terhadap PRD.
+
+**1. Hasil pengelompokan kini tersimpan (PRD 11).**
+Sebelumnya hanya tabel `documents` yang diisi, sehingga kelompok dan koreksi
+manual hilang saat aplikasi ditutup. Sekarang tabel `groups`, `group_members`,
+dan `similarity` diisi, termasuk kolom `match_count` (PRD 10A) yang baru
+ditambahkan lewat migrasi skema otomatis v1 → v2.
+
+- Tersimpan otomatis setiap kali hasil berubah (kelompokkan, verifikasi,
+  pisahkan, gabung).
+- Saat membuka folder, aplikasi menawarkan **“Muat hasil tersimpan?”**.
+- Tombol **Muat Hasil Tersimpan** tersedia di tab Hasil Pengelompokan.
+- Data lama tidak hilang saat upgrade: migrasi hanya menambah kolom.
+
+**2. Pengaturan ambang di antarmuka (PRD 9).**
+Tab **Pengaturan** baru berisi: ambang kemiripan (taut), ambang keyakinan
+tinggi, ambang halaman peta, dan prefilter — disimpan lewat QSettings.
+Nilai divalidasi (keyakinan tinggi harus di atas ambang taut) dan dipakai
+sungguhan oleh analisis serta pengelompokan.
+
+**3. Dashboard lengkap (PRD 8.1).**
+Delapan kartu: Total PDF, Berhasil Dibaca, Gagal Dibaca, Total Halaman,
+Halaman Peta Ditemukan, **Jumlah Kelompok**, **Belum Berkelompok**, Status.
+
+Verifikasi terukur: setelah menutup dan membuka aplikasi, hasil tersimpan
+dimuat kembali dengan status verifikasi, skor 84,4, inlier 341, dan 463
+kecocokan tetap utuh; file PDF asli tidak berubah (SHA-256 identik).
+
+## Fitur Phase 9 (Perbaikan Akurasi)
+
+**Masalah yang diperbaiki:** peta berbeda ikut masuk satu kelompok. Penyebabnya
+bukan clustering, melainkan **skor** — dan penyebabnya terukur, bukan dugaan.
+
+Setiap halaman peta memuat elemen yang sama di semua dokumen: bingkai, panah
+utara, `SKALA 1 : 500`, `PENJELASAN`, `batas tanah ini`. ORB mencocokkan elemen
+itu di **setiap** pasangan. Diukur pada halaman nyata:
+
+| Kasus | area isi | area pinggir | inlier isi |
+| --- | --- | --- | --- |
+| Peta **sama** (SU_057 vs SU_058) | **82,5** | 66,2 | 135 |
+| Peta **beda**, bingkai sama | **1,8 – 5,8** | **100,0** | **0** |
+
+Peta berbeda mendapat area pinggir sempurna (100,0) dengan 786 inlier di sana,
+tetapi **nol inlier di area isi**. Template menyumbang sekitar +64 poin.
+
+**Perbaikan:**
+
+1. **Bukti wajib dari area isi peta.** Indikator dominan sekarang
+   `interior_coverage` (bobot 0,45), bukan cakupan seluruh halaman. Gate keras:
+   cakupan isi ≥ 0,45 dan inlier isi ≥ 25.
+2. **Ambang gabung 82**, bukan 65. PRD 9 menyebut 65–84 "Perlu pemeriksaan" —
+   itu kategori *tampilan*, bukan syarat gabung.
+3. **Rentang 65–81 ditampilkan sebagai "Kandidat (perlu pemeriksaan)"** dan
+   **tidak** digabung otomatis.
+
+Hasil:
+
+| Kasus | Sebelum | Sesudah |
+| --- | --- | --- |
+| Peta sama | 84,4 | 83,0 (tetap bergabung) |
+| Peta sama, rotasi 8° | 70,6 | **85,2** (bergabung) |
+| Peta beda, bingkai sama | 63,5–65,9 | **0,0** (ditolak) |
+
+Rotasi juga jadi lebih stabil karena cakupan seluruh halaman dulu menghukum
+rotasi (0,53 saat rotasi 8°), sedangkan cakupan area isi tetap 0,82.
+
+**Yang perlu Anda lakukan:** jalankan ulang **Kelompokkan**. Pasangan yang
+sebelumnya salah bergabung akan hilang; pasangan yang meragukan muncul di
+simpul *Kandidat* untuk Anda periksa.
+
+**Batasan:** ambang 82 adalah nilai konservatif dari dua dokumen, **bukan hasil
+kalibrasi** pada dataset berlabel (PRD 14). Pasangan asli yang lebih lemah dari 82
+akan menjadi kandidat, bukan kelompok — ini disengaja.
+
 ## Catatan penting tentang orientasi
 
 Kedua dokumen contoh menyimpan halaman peta dalam keadaan **menyamping**
@@ -196,8 +351,14 @@ Langkah penggunaan:
    Hasil overlay muncul bersama ringkasan metrik alignment.
 8. Buka tab **Hasil Pengelompokan**, klik **Kelompokkan** untuk membentuk kelompok.
    Klik anggota kelompok untuk melihat rincian dan melompat ke dokumennya.
-9. Klik **Keluarkan dari Daftar** bila ingin mengeluarkan file dari daftar (file asli tetap utuh).
-10. Klik **Muat Ulang** untuk memindai ulang folder aktif.
+9. Perbaiki hasil bila perlu: **Tandai Terverifikasi**, **Gabungkan ke…**, atau
+   **Pisahkan Dokumen**. Hasil tersimpan otomatis.
+10. Klik **Ekspor Laporan** untuk menyimpan CSV/XLSX, atau **Salin ke Folder** untuk
+    menyalin dokumen ke folder kelompok.
+11. Buka tab **Pengaturan** untuk mengubah ambang kemiripan, ambang halaman peta,
+    atau membersihkan cache analisis. Jalankan ulang pengelompokan agar berlaku.
+12. Klik **Keluarkan dari Daftar** bila ingin mengeluarkan file dari daftar (file asli tetap utuh).
+13. Klik **Muat Ulang** untuk memindai ulang folder aktif.
 
 ## Menjalankan pengujian
 
@@ -206,6 +367,23 @@ Langkah penggunaan:
 ```
 
 Pengujian GUI berjalan headless (`QT_QPA_PLATFORM=offscreen`) sehingga tidak memerlukan layar.
+
+## Membuat executable (PyInstaller)
+
+```powershell
+.\build_exe.bat
+```
+
+Hasil: `dist\LandCADMapGrouper\LandCADMapGrouper.exe` (bundle ~314 MB).
+Jalankan `LandCADMapGrouper.exe`; folder `data\` (log, cache, database, output)
+dibuat otomatis di sebelah executable.
+
+Build manual tanpa skrip:
+
+```powershell
+.\.venv\Scripts\python.exe -m pip install pyinstaller
+.\.venv\Scripts\python.exe -m PyInstaller --clean --noconfirm LandCADMapGrouper.spec
+```
 
 ## Struktur proyek
 
@@ -226,7 +404,10 @@ LandCAD Map Grouper/
 │   ├── comparison_worker.py
 │   ├── comparison_view.py
 │   ├── grouping_worker.py
-│   └── group_results_view.py
+│   ├── group_results_view.py
+│   ├── export_worker.py
+│   ├── settings_store.py
+│   └── settings_view.py
 ├── core/                    # logika citra/PDF tanpa Qt
 │   ├── pdf_reader.py
 │   ├── map_page_detector.py
@@ -235,12 +416,19 @@ LandCAD Map Grouper/
 │   ├── image_alignment.py
 │   ├── parcel_detector.py
 │   ├── similarity_engine.py
-│   └── clustering_engine.py
-├── services/                # orkestrasi (scan, analisis, perbandingan, grouping)
+│   ├── clustering_engine.py
+│   ├── review_model.py
+│   └── diagnose_pair.py
+├── services/                # orkestrasi (scan, analisis, perbandingan, grouping, ekspor)
 │   ├── import_service.py
 │   ├── processing_service.py
 │   ├── comparison_service.py
-│   └── grouping_service.py
+│   ├── grouping_service.py
+│   ├── export_service.py
+│   ├── cache_service.py
+│   └── persistence_service.py
+├── database/                # SQLite (PRD 11)
+│   └── db.py
 ├── utils/
 │   ├── file_utils.py
 │   ├── image_utils.py
@@ -271,7 +459,18 @@ LandCAD Map Grouper/
     ├── test_similarity.py
     ├── test_clustering.py
     ├── test_grouping_service.py
-    └── test_group_results_view.py
+    ├── test_group_results_view.py
+    ├── test_review_model.py
+    ├── test_export_service.py
+    ├── test_cache_service.py
+    ├── test_database.py
+    ├── test_chaining_regression.py
+    ├── test_group_persistence.py
+    ├── test_settings.py
+    ├── test_dashboard.py
+    ├── test_region_similarity.py
+    ├── test_threshold_semantics.py
+    └── test_packaging.py
 ```
 
 ## Catatan keamanan
@@ -282,5 +481,5 @@ LandCAD Map Grouper/
 
 ## Dokumentasi tambahan
 
-- [docs/architecture.md](docs/architecture.md) — keputusan arsitektur (Phase 1–5)
+- [docs/architecture.md](docs/architecture.md) — keputusan arsitektur (Phase 1–9)
 - [docs/user_guide.md](docs/user_guide.md) — panduan penggunaan

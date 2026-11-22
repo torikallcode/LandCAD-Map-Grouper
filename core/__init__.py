@@ -59,6 +59,12 @@ from .parcel_detector import (
     detect_main_parcels,
     parcel_summary,
 )
+from .review_model import (
+    REVIEW_VERSION,
+    UNGROUPED_ID,
+    ReviewState,
+    ReviewedGroup,
+)
 from .similarity_engine import (
     DEFAULT_SIMILARITY_CONFIG,
     SIMILARITY_VERSION,
@@ -150,4 +156,8 @@ __all__ = [
     "prefilter_pair",
     "score_pair",
     "similarity_summary",
+    "REVIEW_VERSION",
+    "UNGROUPED_ID",
+    "ReviewState",
+    "ReviewedGroup",
 ]

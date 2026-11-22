@@ -136,16 +136,25 @@ def test_weights_normalise_to_one():
 
 
 def test_custom_weights_accepted():
-    weights = SimilarityWeights(reference_coverage=0.9, alignment=0.1, inlier_support=0.0,
-                                line_structure=0.0, inlier_spread=0.0)
+    weights = SimilarityWeights(
+        interior_coverage=0.9,
+        alignment=0.1,
+        inlier_support=0.0,
+        line_structure=0.0,
+        inlier_spread=0.0,
+    )
     config = SimilarityConfig(weights=weights)
-    indicators = SimilarityIndicators(reference_coverage=1.0, alignment_quality=0.0)
+    indicators = SimilarityIndicators(interior_coverage=1.0, alignment_quality=0.0)
     assert _score_from_indicators(indicators, config) > 80
 
 
 def test_coverage_dominates_when_it_is_zero():
     indicators = SimilarityIndicators(
-        reference_coverage=0.0, alignment_quality=1.0, inlier_count=1000, inlier_spread=1.0
+        interior_coverage=0.0,
+        alignment_quality=1.0,
+        inlier_count=1000,
+        interior_inliers=1000,
+        inlier_spread=1.0,
     )
     score = _score_from_indicators(indicators, DEFAULT_SIMILARITY_CONFIG)
     assert score < 60

@@ -5,6 +5,8 @@ __pycache__/
 data/logs/
 data/cache/
 data/output/
-*.spec
+data/landcad.db
+data/landcad.db-wal
+data/landcad.db-shm
 build/
 dist/

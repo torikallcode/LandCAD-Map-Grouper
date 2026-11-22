@@ -31,23 +31,30 @@ def _clamp(value: float, low: float = 0.0, high: float = 1.0) -> float:
 class SimilarityWeights:
     """Weights for each indicator. PRD requires more than one indicator.
 
-    Chosen from measurements on the reference documents plus hard negatives:
+    ``interior_coverage`` replaced whole-page coverage as the dominant indicator
+    after measurement showed why whole-page coverage is wrong twice over:
 
-    ===============  ==================  ==================
-    Indicator        genuine (0.72-1.0)  partial negative
-    ===============  ==================  ==================
-    ref_coverage     0.721              0.095-0.314
-    alignment         0.887              0.976 (!)
-    inlier_ratio      0.737              0.955 (!)
-    ===============  ==================  ==================
+    * It counts page furniture (frame, north arrow, legend, scale text), which is
+      identical in every document. A DIFFERENT map inside the same frame scored
+      border coverage 100.0 with 786 inliers there and 0 in the map body.
+    * It punishes rotation: rotating a genuine pair 8 degrees dropped whole-page
+      coverage to 0.53 while interior coverage stayed at 0.82.
 
-    Alignment quality and inlier ratio alone are *not* discriminative: a crop of
-    the same map trivially aligns with ~0.98 quality while covering almost none
-    of the page. Reference coverage is what rejects such partial overlaps, so it
-    carries the largest weight.
+    Measured interior coverage:
+
+    ==========================  =======================
+    Pair                        interior coverage
+    ==========================  =======================
+    same map, rotation 0-10 deg  0.816 - 0.825
+    different map, same frame    0.018 - 0.057
+    unrelated map                0.000
+    ==========================  =======================
+
+    One indicator still cannot decide on its own, so alignment quality, inlier
+    support, line structure and inlier spread keep their supporting role.
     """
 
-    reference_coverage: float = 0.45
+    interior_coverage: float = 0.45
     alignment: float = 0.20
     inlier_support: float = 0.15
     line_structure: float = 0.12
@@ -55,7 +62,7 @@ class SimilarityWeights:
 
     def total(self) -> float:
         return (
-            self.reference_coverage
+            self.interior_coverage
             + self.alignment
             + self.inlier_support
             + self.line_structure
@@ -65,7 +72,7 @@ class SimilarityWeights:
     def normalised(self) -> "SimilarityWeights":
         total = self.total() or 1.0
         return SimilarityWeights(
-            reference_coverage=self.reference_coverage / total,
+            interior_coverage=self.interior_coverage / total,
             alignment=self.alignment / total,
             inlier_support=self.inlier_support / total,
             line_structure=self.line_structure / total,
@@ -89,6 +96,14 @@ class SimilarityConfig:
     tolerance: float = 6.0
     min_reference_coverage: float = 0.40
     min_inliers: int = 30
+    # Evidence must come from the map body, not the page furniture. Measured on
+    # the reference documents: a DIFFERENT map drawn inside the same frame scored
+    # border coverage 100.0 with 786 inliers there, but interior coverage 1.8-5.8
+    # with ZERO interior inliers. Without this gate the template alone lifted such
+    # pairs to ~65 points.
+    interior_margin: float = 0.12
+    min_interior_coverage: float = 0.45
+    min_interior_inliers: int = 25
 
 
 DEFAULT_SIMILARITY_CONFIG = SimilarityConfig()
@@ -106,6 +121,10 @@ class SimilarityIndicators:
     line_structure: float = 0.0
     inlier_spread: float = 0.0
     reprojection_error: float = float("inf")
+    interior_coverage: float = 0.0
+    border_coverage: float = 0.0
+    interior_inliers: int = 0
+    border_inliers: int = 0
 
     def as_dict(self) -> dict[str, float]:
         return {
@@ -117,6 +136,10 @@ class SimilarityIndicators:
             "line_structure": round(self.line_structure, 4),
             "inlier_spread": round(self.inlier_spread, 4),
             "reprojection_error": round(self.reprojection_error, 4),
+            "interior_coverage": round(self.interior_coverage, 4),
+            "border_coverage": round(self.border_coverage, 4),
+            "interior_inliers": float(self.interior_inliers),
+            "border_inliers": float(self.border_inliers),
         }
 
 
@@ -191,6 +214,39 @@ def _directional_coverage(
     return ref_covered, cand_covered
 
 
+def _region_coverage(
+    reference_ink: np.ndarray,
+    warped_ink: np.ndarray,
+    region: np.ndarray,
+    tolerance: float,
+) -> float:
+    """Symmetric ink coverage measured only inside ``region``."""
+    ref = reference_ink & (region > 0)
+    cand = warped_ink & (region > 0)
+    if not ref.any() or not cand.any():
+        return 0.0
+
+    dist_to_cand = cv2.distanceTransform((~warped_ink).astype(np.uint8), cv2.DIST_L2, 3)
+    dist_to_ref = cv2.distanceTransform((~reference_ink).astype(np.uint8), cv2.DIST_L2, 3)
+    ref_covered = float((dist_to_cand[ref] <= tolerance).mean())
+    cand_covered = float((dist_to_ref[cand] <= tolerance).mean())
+    return min(ref_covered, cand_covered)
+
+
+def _split_inliers(
+    points: np.ndarray | None, interior: np.ndarray
+) -> tuple[int, int]:
+    """Count inliers inside the map body versus the page furniture."""
+    if points is None or len(points) == 0:
+        return 0, 0
+    points = np.asarray(points, dtype=np.float64)
+    height, width = interior.shape[:2]
+    ys = np.clip(points[:, 1].astype(int), 0, height - 1)
+    xs = np.clip(points[:, 0].astype(int), 0, width - 1)
+    inside = int(np.count_nonzero(interior[ys, xs] > 0))
+    return inside, int(len(points) - inside)
+
+
 def _line_length(gray: np.ndarray) -> float:
     binary = ink_mask(gray, 225)
     segments = hough_segments(binary)
@@ -225,16 +281,19 @@ def _score_from_indicators(
 ) -> float:
     weights = config.weights.normalised()
 
+    # Only the map body counts as evidence; the page frame is shared by every
+    # document and would otherwise lift unrelated pairs (measured: +64 points).
     coverage = _clamp(
-        indicators.reference_coverage / max(config.reference_coverage_saturation, 1e-6)
+        indicators.interior_coverage
+        / max(config.reference_coverage_saturation, 1e-6)
     )
     alignment = _clamp(indicators.alignment_quality)
-    support = _clamp(indicators.inlier_count / max(config.inlier_saturation, 1))
+    support = _clamp(indicators.interior_inliers / max(config.inlier_saturation, 1))
     structure = _clamp(indicators.line_structure)
     spread = _clamp(indicators.inlier_spread)
 
     combined = (
-        weights.reference_coverage * coverage
+        weights.interior_coverage * coverage
         + weights.alignment * alignment
         + weights.inlier_support * support
         + weights.line_structure * structure
@@ -286,6 +345,24 @@ def score_pair(
         reference_image, warped, config.ink_threshold, config.tolerance
     )
 
+    # Split the evidence: page furniture (frame, north arrow, legend) is identical
+    # in every document, so agreement there is not evidence of a shared map.
+    from core.diagnose_pair import region_split
+
+    split = region_split(
+        to_grayscale(reference_image), config.interior_margin
+    )
+    ref_ink = ink_mask(to_grayscale(reference_image), config.ink_threshold) > 0
+    warped_ink = ink_mask(to_grayscale(warped), config.ink_threshold) > 0
+    interior_cov = _region_coverage(
+        ref_ink, warped_ink, split.interior, config.tolerance
+    )
+    border_cov = _region_coverage(ref_ink, warped_ink, split.border, config.tolerance)
+
+    interior_inliers, border_inliers = _split_inliers(
+        alignment.source_points, split.interior
+    )
+
     ref_line = _line_length(reference_image)
     warped_line = _line_length(warped)
     line_similarity = (
@@ -303,9 +380,14 @@ def score_pair(
         line_structure=line_similarity,
         inlier_spread=_inlier_spread(alignment.source_points, reference_image.shape),
         reprojection_error=alignment.reprojection_error,
+        interior_coverage=interior_cov,
+        border_coverage=border_cov,
+        interior_inliers=interior_inliers,
+        border_inliers=border_inliers,
     )
 
-    # Hard gates: a well-aligned crop still explains almost none of the page.
+    # Hard gates: a well-aligned crop still explains almost none of the page, and
+    # a pair that only shares the page frame has no interior evidence at all.
     reasons: list[str] = []
     if ref_cov < config.min_reference_coverage:
         reasons.append(
@@ -314,6 +396,16 @@ def score_pair(
     if alignment.inlier_count < config.min_inliers:
         reasons.append(
             f"inlier terlalu sedikit ({alignment.inlier_count} < {config.min_inliers})"
+        )
+    if interior_cov < config.min_interior_coverage:
+        reasons.append(
+            f"cakupan area isi peta rendah ({interior_cov:.2f} < "
+            f"{config.min_interior_coverage:.2f})"
+        )
+    if interior_inliers < config.min_interior_inliers:
+        reasons.append(
+            f"bukti di area isi terlalu sedikit ({interior_inliers} < "
+            f"{config.min_interior_inliers}); kecocokan hanya di bingkai/legenda"
         )
 
     if reasons:

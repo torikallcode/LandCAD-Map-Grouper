@@ -8,6 +8,19 @@ from .comparison_service import (
     load_or_extract,
     prepare_comparable,
 )
+from .export_service import (
+    EXPORT_VERSION,
+    REPORT_COLUMNS,
+    ExportResult,
+    ReportRow,
+    build_report_rows,
+    copy_documents_to_folders,
+    export_report,
+    extract_su_number,
+    safe_folder_name,
+    write_csv,
+    write_xlsx,
+)
 from .grouping_service import (
     GroupedDocument,
     GroupingResult,
@@ -58,4 +71,15 @@ __all__ = [
     "group_documents",
     "prepare_documents",
     "prepare_grouped_document",
+    "EXPORT_VERSION",
+    "REPORT_COLUMNS",
+    "ExportResult",
+    "ReportRow",
+    "build_report_rows",
+    "copy_documents_to_folders",
+    "export_report",
+    "extract_su_number",
+    "safe_folder_name",
+    "write_csv",
+    "write_xlsx",
 ]

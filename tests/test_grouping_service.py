@@ -133,6 +133,22 @@ def test_high_threshold_prevents_grouping(pair, tmp_path):
 
 
 def test_low_threshold_groups_reference_pair(pair, tmp_path):
-    loose = ClusterConfig(link_threshold=50.0)
+    """Lowering the join threshold must still group the reference pair."""
+    loose = ClusterConfig(link_threshold=70.0, candidate_threshold=40.0)
     result = group_documents(pair, cache_dir=tmp_path, config=loose)
     assert result.group_count == 1
+
+
+def test_default_threshold_groups_reference_pair(pair, tmp_path):
+    """The reference pair scores ~83, so the default 82 must keep it together."""
+    result = group_documents(pair, cache_dir=tmp_path)
+    assert result.group_count == 1
+    group = result.clustering.groups[0]
+    assert group.min_pair_score >= 82.0
+
+
+def test_candidate_threshold_must_be_below_link_threshold():
+    import pytest as _pytest
+
+    with _pytest.raises(ValueError):
+        ClusterConfig(link_threshold=70.0, candidate_threshold=70.0)

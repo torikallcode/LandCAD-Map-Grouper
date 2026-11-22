@@ -202,36 +202,190 @@ Mengklik anggota juga melompat ke tab Dokumen dengan baris tersebut terpilih.
 | Skor | Kategori | Tindakan |
 | --- | --- | --- |
 | 85–100 | Kemiripan tinggi | Kemungkinan besar satu kelompok |
-| 65–84 | Perlu pemeriksaan | Verifikasi manual disarankan |
+| 82–84 | Perlu pemeriksaan | Tetap digabung, verifikasi disarankan |
+| 65–81 | **Kandidat** | **Tidak digabung** — muncul di simpul *Kandidat* |
 | < 65 | Kemiripan rendah | Dianggap tidak berhubungan |
 
-Pada dokumen contoh, SU_057 dan SU_058 mendapat **84.4** sehingga masuk kelompok
-yang sama tetapi ditandai **perlu verifikasi**.
+Pada dokumen contoh, SU_057 dan SU_058 mendapat **83** sehingga tetap masuk
+kelompok yang sama dengan status perlu verifikasi.
+
+### Kandidat vs kelompok
+
+Sejak perbaikan akurasi, aplikasi **tidak lagi menggabungkan** pasangan yang
+skornya 65–81. Pasangan seperti itu ditampilkan di simpul
+**“Kandidat (perlu pemeriksaan)”** supaya Anda bisa memutuskan sendiri.
+
+Alasannya: setiap halaman peta memiliki bingkai, panah utara, `SKALA 1 : 500`,
+`PENJELASAN`, dan `batas tanah ini` yang **sama di semua dokumen**. Dulu
+kecocokan elemen itu ikut dihitung sehingga peta berbeda bisa tampak mirip.
+Sekarang hanya kecocokan di **area isi peta** yang dihitung sebagai bukti.
 
 ### Hal yang perlu dipahami
 
 - **Dokumen tidak dipaksa berkelompok.** Kalau tidak ada pasangan yang cukup mirip,
   dokumen masuk “Belum Terkelompok”.
+- **Satu pasangan mirip tidak cukup menggabungkan dua kelompok.** Pengelompokan
+  memakai kemiripan rata-rata antar anggota, sehingga rantai peta yang saling
+  bertetangga tidak lagi menyeret seluruh batch menjadi satu kelompok.
+  (Sebelum perbaikan, 118 PDF dengan peta berbeda bisa masuk satu kelompok.)
 - **Halaman penuh tidak dicocokkan dengan potongan halaman.** Skornya akan 0 karena
   potongan hanya menjelaskan sebagian kecil peta; ini disengaja agar potongan tidak
   salah dianggap peta yang sama.
 - Ambang 65 dan 85 masih nilai awal dan belum dikalibrasi pada dataset berlabel.
+- Bila hasilnya masih terlalu ketat atau terlalu longgar, gunakan **Koreksi**
+  (gabung/pisah) — dan laporkan contohnya agar ambang bisa dikalibrasi.
 
-## 15. Mengeluarkan file dari daftar
+## 15. Mengoreksi hasil pengelompokan (Phase 6)
+
+Setelah pengelompokan selesai, bar **Koreksi** aktif:
+
+| Tombol | Kegunaan |
+| --- | --- |
+| **Tandai Terverifikasi** | Menandai kelompok terpilih sudah dicek manusia |
+| **Batalkan Verifikasi** | Mengembalikan status perlu verifikasi |
+| **Gabungkan ke…** | Menggabungkan kelompok terpilih ke kelompok pada dropdown |
+| **Pisahkan Dokumen** | Mengeluarkan dokumen terpilih dari kelompoknya |
+| **Kembalikan Otomatis** | Membuang semua koreksi, kembali ke hasil mesin |
+
+Petunjuk pemakaian:
+
+1. Klik **baris kelompok** (mis. `KELOMPOK_001`) lalu pilih tindakan kelompok.
+2. Klik **baris dokumen** lalu **Pisahkan Dokumen** untuk memisahkan satu dokumen.
+3. Setiap perubahan otomatis membatalkan verifikasi kelompok tersebut — hasil yang
+   berubah tidak boleh tampak sudah diverifikasi.
+
+Kelompok terverifikasi ditandai **biru**. Dokumen yang dipisahkan masuk ke
+**Belum Terkelompok** dan tidak pernah dipaksa kembali ke kelompok lain.
+
+## 16. Mengekspor laporan
+
+Klik **Ekspor Laporan**, pilih lokasi dan format:
+
+| Format | Keterangan |
+| --- | --- |
+| `.xlsx` | Excel, header tebal, lebar kolom diatur |
+| `.csv` | Dipisah titik koma, UTF-8, aman dibuka di Excel Indonesia |
+
+Kolom laporan: Nama file, Nomor SU, Halaman peta, ID kelompok, Jumlah pasangan
+cocok, Skor kemiripan, Confidence, Status.
+
+Kolom **Nomor SU** hanya terisi bila nama file mengikuti pola `SU_057`. Sistem
+tidak mengarang nomor.
+
+## 17. Menyalin dokumen ke folder kelompok
+
+Klik **Salin ke Folder**, pilih folder tujuan. Struktur yang dihasilkan:
+
+```
+<folder tujuan>/
+├── KELOMPOK_001/
+│   ├── SU_057.pdf
+│   └── SU_058.pdf
+└── BELUM_TERKELOMPOK/
+```
+
+Penting:
+
+- Operasi **salin**, bukan pindah. File asli **tidak diubah atau dihapus**.
+- File yang sudah ada di folder tujuan **dilewati**, jadi aman dijalankan berulang.
+- Bila masih ada kelompok belum terverifikasi, aplikasi meminta konfirmasi dulu.
+
+## 19. Kinerja dan cache (Phase 7)
+
+Aplikasi menyimpan hasil analisis agar dokumen yang sama tidak dihitung ulang.
+
+- Analisis pertama untuk sebuah dokumen memakan ~1 detik.
+- Analisis kedua (cache hangat) hanya ~85 ms — **15× lebih cepat**.
+- Cache disimpan di `data/cache/analysis/`, sekitar 166 KB per dokumen.
+
+Cache otomatis **digugurkan** bila: isi PDF berubah, atau algoritma diperbarui
+(versi detektor/normalisasi/bidang). Jadi hasil lama tidak pernah tercampur dengan
+hasil baru.
+
+Aplikasi juga menyimpan metadata ke `data/landcad.db` (SQLite) agar daftar dokumen
+dan halaman peta tercatat.
+
+### Kapan perlu membersihkan cache?
+
+Bila folder `data/` terasa besar, Anda boleh menghapus isi
+`data/cache/analysis/` saat aplikasi tertutup. Analisis berikutnya akan menghitung
+ulang (lebih lambat sekali, lalu cepat lagi).
+
+## 20. Hasil tersimpan (Phase 8)
+
+Hasil pengelompokan dan koreksi manual kini **disimpan otomatis** ke database
+(`data/landcad.db`) setiap kali berubah — setelah mengelompokkan, memverifikasi,
+memisahkan, atau menggabungkan.
+
+Cara memuatnya kembali:
+
+- Saat membuka folder, aplikasi menanyakan **“Muat hasil pengelompokan tersimpan?”**
+  bila menemukan hasil untuk dokumen di folder itu.
+- Atau buka tab **Hasil Pengelompokan** lalu klik **Muat Hasil Tersimpan**.
+
+Yang ikut dipulihkan: anggota kelompok, status verifikasi, dan skor pasangan.
+Dokumen yang filenya sudah dihapus/dipindahkan akan dilewati dan dilaporkan.
+
+## 21. Pengaturan ambang (Phase 8)
+
+Tab **Pengaturan** memungkinkan mengubah:
+
+| Pengaturan | Arti |
+| --- | --- |
+| Ambang gabung kelompok | Pasangan ≥ nilai ini boleh digabung (default 82) |
+| Ambang keyakinan tinggi | Kelompok dengan skor terendah di atas nilai ini berstatus Tinggi |
+| Ambang halaman peta | Skor minimal sebuah halaman agar dianggap halaman peta |
+| Prefilter | Lewati pasangan yang jelas tidak cocok (menghemat waktu) |
+
+Pasangan di antara 65 dan ambang gabung **tidak** digabung; mereka muncul sebagai
+kandidat untuk diperiksa manual.
+
+Tombol **Simpan** menerapkan, **Kembalikan Default** mengembalikan 82/85/0.45, dan
+**Bersihkan Cache Analisis** menghapus cache gambar (analisis berikutnya lebih
+lambat sekali).
+
+Ambang keyakinan tinggi wajib lebih besar dari ambang taut; bila tidak, aplikasi
+menolak menyimpan.
+
+Perubahan ambang **tidak** otomatis menghitung ulang. Jalankan **Deteksi Halaman
+Peta** (untuk ambang halaman) atau **Kelompokkan** (untuk ambang kemiripan) lagi.
+
+## 22. Dashboard
+
+Delapan kartu ringkasan: Total PDF, Berhasil Dibaca, Gagal Dibaca, Total Halaman,
+Halaman Peta Ditemukan, **Jumlah Kelompok**, **Belum Berkelompok**, dan Status
+Proses. Kartu kelompok ikut berubah saat Anda memisahkan atau menggabungkan
+kelompok.
+
+## 23. Menjalankan versi portable (executable)
+
+Bila Anda menerima folder `LandCADMapGrouper`, cukup jalankan
+`LandCADMapGrouper.exe`. Tidak perlu Python.
+Folder `data\` (log, cache, database, output) dibuat otomatis di sebelah executable,
+jadi letakkan folder aplikasi di lokasi yang dapat ditulis (mis. Desktop atau
+`D:\Aplikasi\`), bukan di `Program Files` tanpa izin admin.
+
+## 24. Mengeluarkan file dari daftar
 
 Pilih baris, klik **Keluarkan dari Daftar**. File hanya dihapus dari daftar kerja
 aplikasi — **file asli di disk tidak diubah atau dihapus**.
 Gunakan **Muat Ulang** (`F5`) untuk memunculkannya kembali.
 
-## 16. Log
+## 25. Log
 
 Aktivitas pencatatan tersimpan di `data/logs/landcad.log` (maksimum ~1 MB per file,
 3 file rotasi). Log tidak memuat isi dokumen.
 
-## 17. Batasan versi ini
+## 26. Batasan versi ini
 
-- Belum ada koreksi manual kelompok (gabung/pisah) dan ekspor laporan (Phase 6).
-- Belum ada penyalinan file ke folder kelompok.
-- Hasil pengelompokan hilang saat aplikasi ditutup (belum disimpan ke database).
-- Hasil deteksi bidang belum bisa dikoreksi manual.
+- Cache analisis belum punya batas ukuran otomatis (tombol bersihkan sudah ada di
+  tab Pengaturan).
+- Hasil tersimpan hanya untuk batch terakhir; belum ada riwayat beberapa sesi.
+- Catatan per kelompok belum disimpan (tidak ada kolomnya di PRD 11).
+- Pengelompokan masih membandingkan semua pasangan (O(n²)); cache mempercepat
+  tiap perbandingan, bukan mengurangi jumlahnya.
+- Ambang 82 adalah nilai konservatif dari pengukuran dua dokumen, belum
+  dikalibrasi pada dataset berlabel (PRD 14). Pasangan asli yang lebih lemah dari
+  82 akan muncul sebagai kandidat, bukan kelompok.
+- Belum ada installer maupun tanda tangan digital untuk executable.
 - Orientasi 180° tidak dibedakan dari 0°.

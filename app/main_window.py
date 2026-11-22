@@ -34,10 +34,20 @@ from app.models import (
 )
 from app.preview_view import PreviewPanel
 from app.scan_worker import ScanWorker
-from config import APP_NAME, MAP_PAGE_THRESHOLD, RECURSIVE_SCAN_DEFAULT
+from app.settings_store import AppSettings, load_settings
+from app.settings_view import SettingsView
+from config import APP_NAME, RECURSIVE_SCAN_DEFAULT
+from core.clustering_engine import ClusterConfig
 from core.map_page_detector import MapPageDetector
 from core.pdf_reader import PdfInfo
+from database import db
+from services.cache_service import AnalysisCache, file_fingerprint
 from services.import_service import ImportResult, find_pdf_files
+from services.persistence_service import (
+    RestoredReview,
+    load_review,
+    save_review,
+)
 from services.processing_service import (
     AnalysisResult,
     DocumentAnalysis,
@@ -51,7 +61,7 @@ logger = get_logger("main_window")
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle(f"{APP_NAME} — Phase 5 (Similarity & Clustering)")
+        self.setWindowTitle(f"{APP_NAME} — Phase 9 (Perbaikan Akurasi)")
         self.resize(1360, 880)
         self.setMinimumSize(1020, 660)
 
@@ -64,6 +74,10 @@ class MainWindow(QMainWindow):
         self._model = DocumentTableModel(parent=self)
         self._proxy = DocumentFilterProxyModel(self)
         self._proxy.setSourceModel(self._model)
+
+        self._analysis_cache = AnalysisCache()
+        self._database_path = db.initialize()
+        self._settings: AppSettings = load_settings()
 
         self._build_ui()
         self._build_actions()
@@ -102,7 +116,16 @@ class MainWindow(QMainWindow):
 
         self._group_view = GroupResultsView()
         self._group_view.document_selected.connect(self._select_document_by_key)
+        self._group_view.set_analysis_cache(self._analysis_cache)
+        self._group_view.set_cluster_config(self._cluster_config())
+        self._group_view.review_changed.connect(self._on_review_changed)
+        self._group_view.restore_requested.connect(self._restore_saved_review)
         self._workspace_tabs.addTab(self._group_view, "Hasil Pengelompokan")
+
+        self._settings_view = SettingsView(self._settings)
+        self._settings_view.settings_changed.connect(self._on_settings_changed)
+        self._settings_view.clear_cache_requested.connect(self._clear_analysis_cache)
+        self._workspace_tabs.addTab(self._settings_view, "Pengaturan")
 
         root.addWidget(self._workspace_tabs, 1)
 
@@ -315,7 +338,11 @@ class MainWindow(QMainWindow):
         self._progress.setVisible(True)
         self._set_busy(True, f"Menganalisis {len(valid)} dokumen…")
 
-        worker = AnalysisWorker(valid, MapPageDetector(threshold=MAP_PAGE_THRESHOLD), parent=self)
+        worker = AnalysisWorker(
+            valid,
+            MapPageDetector(threshold=self._settings.map_page_threshold),
+            parent=self,
+        )
         worker.progress.connect(self._on_analysis_progress)
         worker.document_done.connect(self._on_document_analysed)
         worker.finished_ok.connect(self._on_analysis_finished)
@@ -342,6 +369,7 @@ class MainWindow(QMainWindow):
         self._progress.setValue(self._progress.maximum())
         self._refresh_selected_preview()
         self._refresh_comparison_sources()
+        self._persist_analysis(result)
         self._update_summary()
 
         message = (
@@ -394,6 +422,7 @@ class MainWindow(QMainWindow):
         message += " Klik “Deteksi Halaman Peta” untuk melanjutkan."
         self._status_bar.showMessage(message)
         logger.info(message)
+        self._offer_saved_review()
 
     def _on_scan_failed(self, message: str) -> None:
         self._status_bar.showMessage("Pemindaian gagal.")
@@ -454,6 +483,34 @@ class MainWindow(QMainWindow):
                 f"{document.filename} — {document.page_count} halaman"
             )
 
+    def _persist_analysis(self, result: AnalysisResult) -> None:
+        """Record document metadata and map pages in SQLite (PRD section 11).
+
+        Only metadata is stored; descriptors stay in cache files because the PRD
+        prefers files when they are more efficient.
+        """
+        try:
+            with db.connect(self._database_path) as connection:
+                for item in result.documents:
+                    info = item.info
+                    try:
+                        fingerprint = file_fingerprint(info.path)
+                    except OSError:
+                        fingerprint = ""
+                    db.upsert_document(
+                        connection,
+                        filename=info.filename,
+                        original_path=str(info.path.resolve()),
+                        file_hash=fingerprint,
+                        page_count=info.page_count,
+                        map_page=item.map_page_number,
+                        processing_status=(
+                            "gagal" if item.has_error else "dianalisis"
+                        ),
+                    )
+        except Exception as exc:  # noqa: BLE001 - persistence must never crash the UI
+            logger.warning("Gagal menyimpan ke database: %s", exc)
+
     def _refresh_comparison_sources(self) -> None:
         """Offer only documents whose map page was actually found."""
         comparables = [
@@ -475,6 +532,97 @@ class MainWindow(QMainWindow):
                 self._table.selectRow(row)
                 self._workspace_tabs.setCurrentIndex(0)
                 return
+
+    # ------------------------------------------------------------- settings
+    def _cluster_config(self) -> ClusterConfig:
+        return ClusterConfig(
+            link_threshold=self._settings.link_threshold,
+            high_confidence_threshold=self._settings.high_confidence_threshold,
+            prefilter_enabled=self._settings.prefilter_enabled,
+        )
+
+    def _on_settings_changed(self, settings: AppSettings) -> None:
+        self._settings = settings
+        self._group_view.set_cluster_config(self._cluster_config())
+        self._status_bar.showMessage(
+            "Pengaturan tersimpan. Jalankan ulang pengelompokan agar berlaku."
+        )
+
+    def _clear_analysis_cache(self) -> None:
+        removed = self._analysis_cache.clear()
+        self._settings_view.set_status(
+            f"Cache analisis dibersihkan ({removed} entri)."
+        )
+        self._status_bar.showMessage(f"Cache analisis dibersihkan ({removed} entri).")
+
+    # ------------------------------------------------------------ summarize
+    def _on_review_changed(self) -> None:
+        self._update_summary()
+        review = self._group_view.current_review()
+        if review is not None and review.total_groups:
+            save_review(self._database_path, review, self._document_map())
+            self._group_view.set_restore_available(True)
+
+    def _document_map(self) -> dict[str, PdfInfo]:
+        return {document.key: document for document in self._documents}
+
+    def _restore_saved_review(self) -> None:
+        restored = load_review(self._database_path, only_within=self._folder)
+        if restored is None or restored.is_empty:
+            QMessageBox.information(
+                self, "Tidak ada hasil tersimpan", "Belum ada kelompok tersimpan."
+            )
+            return
+        self._apply_restored(restored)
+
+    def _apply_restored(self, restored: RestoredReview) -> None:
+        documents = [
+            info for info in self._document_map().values()
+            if info.key in restored.documents
+        ]
+        if not documents:
+            QMessageBox.information(
+                self,
+                "Hasil tersimpan tidak cocok",
+                "Dokumen pada hasil tersimpan tidak ada di folder yang sedang dibuka.",
+            )
+            return
+
+        self._group_view.adopt_review(restored.state, documents)
+        self._workspace_tabs.setCurrentIndex(2)
+        message = (
+            f"Hasil tersimpan dimuat: {restored.state.total_groups} kelompok, "
+            f"{len(restored.state.ungrouped)} belum terkelompok."
+        )
+        if restored.missing_paths:
+            message += f" {len(restored.missing_paths)} file tidak ditemukan."
+        self._status_bar.showMessage(message)
+
+    def _offer_saved_review(self) -> None:
+        """Ask before applying a saved review from an earlier session."""
+        restored = load_review(self._database_path, only_within=self._folder)
+        if restored is None or restored.is_empty:
+            self._group_view.set_restore_available(False)
+            return
+
+        matched = [
+            info for info in self._document_map().values()
+            if info.key in restored.documents
+        ]
+        self._group_view.set_restore_available(bool(matched))
+        if len(matched) < 2:
+            return
+
+        answer = QMessageBox.question(
+            self,
+            "Ada hasil pengelompokan tersimpan",
+            f"Ditemukan hasil pengelompokan tersimpan untuk {len(matched)} dokumen "
+            "di folder ini.\n\nMuat hasil tersebut?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.Yes,
+        )
+        if answer == QMessageBox.StandardButton.Yes:
+            self._apply_restored(restored)
 
     # ------------------------------------------------------------- helpers
     def _selected_document(self) -> PdfInfo | None:
@@ -504,6 +652,10 @@ class MainWindow(QMainWindow):
             if analysis.map_page_number is not None:
                 map_found += 1
 
+        review = self._group_view.current_review()
+        group_count = review.total_groups if review is not None else 0
+        ungrouped_count = len(review.ungrouped) if review is not None else 0
+
         self._dashboard.update_summary(
             total=total,
             valid=valid,
@@ -512,6 +664,8 @@ class MainWindow(QMainWindow):
             map_found=map_found,
             analysed=analysed,
             status=self._current_status(),
+            group_count=group_count,
+            ungrouped_count=ungrouped_count,
         )
 
     def _current_status(self) -> str:

@@ -18,6 +18,7 @@ from core.clustering_engine import (
 from core.feature_extractor import OrbFeatures
 from core.pdf_reader import PdfInfo
 from core.similarity_engine import similarity_summary
+from services.cache_service import AnalysisCache
 from services.comparison_service import (
     CACHE_VERSION,
     ComparableMap,
@@ -104,6 +105,7 @@ class GroupingResult:
 def prepare_grouped_document(
     info: PdfInfo,
     cache_dir: Path | None = None,
+    analysis_cache: AnalysisCache | None = None,
 ) -> GroupedDocument:
     """Prepare one document using the parcel-free map when available.
 
@@ -111,7 +113,9 @@ def prepare_grouped_document(
     documents sharing a base map group together even when their main parcels sit
     in different places.
     """
-    comparable = prepare_comparable(info, cache_dir=cache_dir)
+    comparable = prepare_comparable(
+        info, cache_dir=cache_dir, analysis_cache=analysis_cache
+    )
 
     if comparable.masked_image is not None and comparable.masked_features is not None:
         image = comparable.masked_image
@@ -130,6 +134,7 @@ def prepare_documents(
     cache_dir: Path | None = None,
     progress: ProgressCallback | None = None,
     should_cancel: CancelCheck | None = None,
+    analysis_cache: AnalysisCache | None = None,
 ) -> tuple[list[GroupedDocument], list[str], bool]:
     prepared: list[GroupedDocument] = []
     errors: list[str] = []
@@ -141,7 +146,11 @@ def prepare_documents(
         if progress is not None:
             progress(index, total, f"Menyiapkan {info.filename}")
         try:
-            prepared.append(prepare_grouped_document(info, cache_dir=cache_dir))
+            prepared.append(
+                prepare_grouped_document(
+                    info, cache_dir=cache_dir, analysis_cache=analysis_cache
+                )
+            )
         except Exception as exc:  # noqa: BLE001 - one bad document must not stop the batch
             logger.warning("Gagal menyiapkan %s: %s", info.filename, exc)
             errors.append(f"{info.filename}: {exc}")
@@ -156,13 +165,18 @@ def group_documents(
     progress: ProgressCallback | None = None,
     should_cancel: CancelCheck | None = None,
     prepared: list[GroupedDocument] | None = None,
+    analysis_cache: AnalysisCache | None = None,
 ) -> GroupingResult:
     """Prepare documents and group them by base-map similarity."""
     errors: list[str] = []
 
     if prepared is None:
         prepared, errors, cancelled = prepare_documents(
-            documents, cache_dir=cache_dir, progress=progress, should_cancel=should_cancel
+            documents,
+            cache_dir=cache_dir,
+            progress=progress,
+            should_cancel=should_cancel,
+            analysis_cache=analysis_cache,
         )
         if cancelled:
             return GroupingResult(

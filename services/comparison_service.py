@@ -41,6 +41,12 @@ from core.parcel_detector import (
     detect_main_parcels,
 )
 from core.pdf_reader import PdfInfo
+from services.cache_service import (
+    AnalysisCache,
+    CachedAnalysis,
+    analysis_cache_key,
+    file_fingerprint,
+)
 from services.processing_service import DocumentAnalysis, analyse_document
 from utils.image_utils import encode_png, to_grayscale
 from utils.logging_utils import get_logger
@@ -177,7 +183,22 @@ def prepare_comparable(
     cache_dir: Path | None = None,
     feature_config: FeatureConfig = DEFAULT_FEATURE_CONFIG,
     parcel_config: ParcelConfig = DEFAULT_PARCEL_CONFIG,
+    analysis_cache: "AnalysisCache | None" = None,
+    use_analysis_cache: bool = True,
 ) -> ComparableMap:
+    """Prepare a document for comparison.
+
+    The analysis cache is the difference between ~1.0 s and a few milliseconds on
+    a repeat run: rendering, page detection and normalisation dominate the cost,
+    while ORB itself needs only ~27 ms.
+    """
+    cached = None
+    if use_analysis_cache and analysis_cache is not None:
+        cached = _load_cached(info, analysis_cache)
+
+    if cached is not None:
+        return _comparable_from_cache(info, cached, cache_dir, feature_config)
+
     analysis = analyse_document(info, detector or MapPageDetector())
     if analysis.normalized is None:
         raise ValueError(
@@ -196,6 +217,9 @@ def prepare_comparable(
         masked_image = mask.apply(image)
         masked_features, _ = load_or_extract(masked_image, cache_dir, feature_config)
 
+    if use_analysis_cache and analysis_cache is not None:
+        _store_analysis(info, analysis, image, masked_image, parcel, analysis_cache)
+
     return ComparableMap(
         info=info,
         analysis=analysis,
@@ -205,6 +229,137 @@ def prepare_comparable(
         parcel=parcel,
         parcel_mask=mask,
         masked_image=masked_image,
+        masked_features=masked_features,
+    )
+
+
+def _load_cached(info: PdfInfo, cache: AnalysisCache) -> CachedAnalysis | None:
+    if not info.is_valid:
+        return None
+    try:
+        fingerprint = file_fingerprint(info.path)
+    except OSError as exc:
+        logger.warning("Tidak dapat menghitung hash %s: %s", info.filename, exc)
+        return None
+
+    from config import MAP_DETECTION_DPI
+
+    key = analysis_cache_key(fingerprint, MAP_DETECTION_DPI)
+    return cache.load(key, info)
+
+
+def _store_analysis(info, analysis, image, masked_image, parcel, cache: AnalysisCache) -> None:
+    from config import MAP_DETECTION_DPI
+
+    try:
+        fingerprint = file_fingerprint(info.path)
+    except OSError as exc:
+        logger.warning("Tidak dapat menghitung hash %s: %s", info.filename, exc)
+        return
+
+    detection = analysis.detection
+    scores = ()
+    if detection is not None:
+        scores = tuple(
+            (page.page_index, page.score, page.is_map) for page in detection.pages
+        )
+
+    polygons = ()
+    confidences = ()
+    if parcel is not None and parcel.has_parcel:
+        polygons = tuple(candidate.polygon for candidate in parcel.candidates)
+        confidences = tuple(candidate.confidence for candidate in parcel.candidates)
+
+    cache.store(
+        CachedAnalysis(
+            key=analysis_cache_key(fingerprint, MAP_DETECTION_DPI),
+            info=info,
+            map_page=analysis.map_page_number - 1 if analysis.map_page_number else None,
+            page_count=info.page_count,
+            detection_scores=scores,
+            normalized=image,
+            masked=masked_image,
+            parcel_polygons=polygons,
+            parcel_confidences=confidences,
+        )
+    )
+
+
+def _comparable_from_cache(
+    info: PdfInfo,
+    cached: CachedAnalysis,
+    cache_dir: Path | None,
+    feature_config: FeatureConfig,
+) -> ComparableMap:
+    """Rebuild everything from cached images without re-rendering the PDF."""
+    from core.image_normalizer import (
+        NormalizedImage,
+        OrientationEstimate,
+        SkewEstimate,
+    )
+    from core.map_page_detector import MapDetectionResult, PageAssessment, PageFeatures
+    from core.parcel_detector import ParcelCandidate, ParcelDetection
+    from services.processing_service import DocumentAnalysis
+
+    if cached.normalized is None:
+        raise ValueError(f"{info.filename}: cache tidak memuat peta.")
+
+    image = cached.normalized
+    features, cache_hit = load_or_extract(image, cache_dir, feature_config)
+
+    # Reuse the stored polygons instead of running contour detection again; only
+    # the mask itself has to be redrawn, which is a cheap polyline call.
+    candidates = tuple(
+        ParcelCandidate(
+            polygon=polygon,
+            confidence=confidence,
+            dark_fraction=1.0 if confidence >= 0.5 else 0.0,
+        )
+        for polygon, confidence in zip(cached.parcel_polygons, cached.parcel_confidences)
+    )
+    parcel = ParcelDetection(candidates=candidates)
+    mask = build_parcel_mask(image, parcel)
+
+    masked = cached.masked
+    if masked is None and not mask.is_empty:
+        masked = mask.apply(image)
+    masked_features = None
+    if masked is not None:
+        masked_features, _ = load_or_extract(masked, cache_dir, feature_config)
+
+    pages = tuple(
+        PageAssessment(
+            page_index=index,
+            is_map=is_map,
+            score=score,
+            features=PageFeatures(),
+        )
+        for index, score, is_map in cached.detection_scores
+    )
+    detection = MapDetectionResult(pages=pages, map_page=cached.map_page)
+
+    # Skew and orientation are already applied to the cached image, so the
+    # metadata is reported as neutral rather than pretending a fresh estimate.
+    normalized = NormalizedImage(
+        image=image,
+        original=image,
+        scale=1.0,
+        skew=SkewEstimate(),
+        orientation=OrientationEstimate(reason="dari cache"),
+        steps=("cache",),
+    )
+
+    analysis = DocumentAnalysis(info=info, detection=detection, normalized=normalized)
+
+    return ComparableMap(
+        info=info,
+        analysis=analysis,
+        image=image,
+        features=features,
+        cache_hit=cache_hit,
+        parcel=parcel,
+        parcel_mask=mask,
+        masked_image=masked,
         masked_features=masked_features,
     )
 

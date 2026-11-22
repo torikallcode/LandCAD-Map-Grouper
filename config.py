@@ -1,15 +1,30 @@
 from __future__ import annotations
 
 import os
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 
 APP_NAME = "LandCAD Map Grouper"
-APP_VERSION = "0.5.0"
+APP_VERSION = "0.9.0"
 APP_ORGANIZATION = "LandCAD"
 
+
+def _runtime_root() -> Path:
+    """Directory that should hold writable app data.
+
+    When frozen by PyInstaller ``__file__`` lives inside ``_internal``, which is
+    read-only in a normal install (and would also lose data on upgrade). The
+    executable's own directory is the right place for ``data/``.
+    """
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent
+
+
 PROJECT_ROOT = Path(__file__).resolve().parent
-DATA_DIR = PROJECT_ROOT / "data"
+RUNTIME_ROOT = _runtime_root()
+DATA_DIR = RUNTIME_ROOT / "data"
 LOG_DIR = DATA_DIR / "logs"
 CACHE_DIR = DATA_DIR / "cache"
 OUTPUT_DIR = DATA_DIR / "output"
